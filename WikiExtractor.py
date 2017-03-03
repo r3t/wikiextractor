@@ -178,6 +178,10 @@ options = SimpleNamespace(
     print_revision=False,
 
     ##
+    # Print the wikipedia article redirect
+    print_redirect=False,
+
+    ##
     # Minimum expanded text length required to print document
     min_text_length=0,
     
@@ -524,7 +528,7 @@ class Extractor(object):
     """
     An extraction task on a article.
     """
-    def __init__(self, id, revid, title, lines):
+    def __init__(self, id, revid, title, lines, redirect):
         """
         :param id: id of page.
         :param title: tutle of page.
@@ -534,6 +538,7 @@ class Extractor(object):
         self.revid = revid
         self.title = title
         self.text = ''.join(lines)
+        self.redirect = redirect
         self.magicWords = MagicWords()
         self.frame = Frame()
         self.recursion_exceeded_1_errs = 0  # template recursion within expand()
@@ -556,6 +561,8 @@ class Extractor(object):
             }
             if options.print_revision:
                 json_data['revid'] = self.revid
+            if options.print_redirect and self.redirect is not None:
+                json_data['redirect'] = self.redirect
             # We don't use json.dump(data, out) because we want to be
             # able to encode the string if the output is sys.stdout
             out_str = json.dumps(json_data, ensure_ascii=False)
@@ -564,10 +571,7 @@ class Extractor(object):
             out.write(out_str)
             out.write('\n')
         else:
-            if options.print_revision:
-                header = '<doc id="%s" revid="%s" url="%s" title="%s">\n' % (self.id, self.revid, url, self.title)
-            else:
-                header = '<doc id="%s" url="%s" title="%s">\n' % (self.id, url, self.title)
+            header = self.make_xml_header(url)
             footer = "\n</doc>\n"
             if out == sys.stdout:   # option -a or -o -
                 header = header.encode('utf-8')
@@ -579,12 +583,24 @@ class Extractor(object):
                 out.write('\n')
             out.write(footer)
 
+        def make_xml_header(self, url):
+            attribs = {'id': self.id, 'url': url, 'title': self.title}
+            if options.print_revision:
+                attribs['revid'] = self.revid
+            if options.print_redirect and self.redirect is not None:
+                attribs['redirect'] = self.redirect
+            header = []
+            for key in ['id', 'revid', 'url', 'title', 'redirect']:
+                if key in attribs:
+                    header.append('%s="%s"' % (attrib, attribs[key]))
+            return "<doc %s>\n" % " ".join(header)
+
     def extract(self, out):
         """
         :param out: a memory file.
         """
         logging.info('%s\t%s', self.id, self.title)
-        
+
         # Separate header from text with a newline.
         if options.toHTML:
             title_str = '<h1>' + self.title + '</h1>'
@@ -1901,10 +1917,11 @@ def define_template(title, page):
     # title = normalizeTitle(title)
 
     # check for redirects
-    m = re.match('#REDIRECT.*?\[\[([^\]]*)]]', page[0], re.IGNORECASE)
-    if m:
-        options.redirects[title] = m.group(1)  # normalizeTitle(m.group(1))
-        return
+    if page:
+        m = re.match('#REDIRECT.*?\[\[([^\]]*)]]', page[0], re.IGNORECASE)
+        if m:
+            options.redirects[title] = m.group(1)  # normalizeTitle(m.group(1))
+            return
 
     text = unescape(''.join(page))
 
@@ -2661,7 +2678,7 @@ def load_templates(file, output_file=None):
     if output_file:
         output = codecs.open(output_file, 'wb', 'utf-8')
     for page_count, page_data in enumerate(pages_from(file)):
-        id, revid, title, ns, page = page_data
+        id, revid, title, ns, page, redirect = page_data
         if not output_file and (not options.templateNamespace or
                                 not options.moduleNamespace):  # do not know it yet
             # reconstruct templateNamespace and moduleNamespace from the first title
@@ -2695,6 +2712,15 @@ def load_templates(file, output_file=None):
         logging.info("Saved %d templates to '%s'", len(options.templates), output_file)
 
 
+def extract_redirect(line):
+    # we have something like that in line:
+    # '<redirect title="NEED_TEXT_HERE" />' and we need text between quoties,
+    # so we split on ", get ['<redirect title=', 'NEED_TEXT_HERE', ' />'] and
+    # take first element. It's a little bit faster than regex. 
+    p = line.split('"')
+    return p[1]
+
+
 def pages_from(input):
     """
     Scans input extracting pages.
@@ -2708,7 +2734,7 @@ def pages_from(input):
     last_id = None
     revid = None
     inText = False
-    redirect = False
+    redirect = None
     title = None
     for line in input:
         if not isinstance(line, text_type): line = line.decode('utf-8')
@@ -2722,7 +2748,7 @@ def pages_from(input):
         tag = m.group(2)
         if tag == 'page':
             page = []
-            redirect = False
+            redirect = None
         elif tag == 'id' and not id:
             id = m.group(3)
         elif tag == 'id' and id:
@@ -2732,7 +2758,7 @@ def pages_from(input):
         elif tag == 'ns':
             ns = m.group(3)
         elif tag == 'redirect':
-            redirect = True
+            redirect = extract_redirect(line)
         elif tag == 'text':
             if m.lastindex == 3 and line[m.start(3)-2] == '/': # self closing
                 # <text xml:space="preserve" />
@@ -2749,13 +2775,14 @@ def pages_from(input):
         elif inText:
             page.append(line)
         elif tag == '/page':
-            if id != last_id and not redirect:
-                yield (id, revid, title, ns, page)
+            if id != last_id:
+                yield (id, revid, title, ns, page, redirect)
                 last_id = id
                 ns = '0'
             id = None
             revid = None
             title = None
+            redirect = None
             page = []
 
 
@@ -2865,7 +2892,7 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
     # Mapper process
     page_num = 0
     for page_data in pages_from(input):
-        id, revid, title, ns, page = page_data
+        id, revid, title, ns, page, redirect = page_data
         if keepPage(ns, page):
             # slow down
             delay = 0
@@ -2876,7 +2903,7 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
                     delay += 10
             if delay:
                 logging.info('Delay %ds', delay)
-            job = (id, revid, title, page, page_num)
+            job = (id, revid, title, page, redirect, page_num)
             jobs_queue.put(job) # goes to any available extract_process
             page_num += 1
         page = None             # free memory
@@ -2923,9 +2950,9 @@ def extract_process(opts, i, jobs_queue, output_queue):
     while True:
         job = jobs_queue.get()  # job is (id, title, page, page_num)
         if job:
-            id, revid, title, page, page_num = job
+            id, revid, title, page, redirect, page_num = job
             try:
-                e = Extractor(*job[:4]) # (id, revid, title, page)
+                e = Extractor(*job[:-1]) # (id, revid, title, page, redirect)
                 page = None              # free memory
                 e.extract(out)
                 text = out.getvalue()
@@ -3042,6 +3069,8 @@ def main():
                         help="Do not expand templates")
     groupP.add_argument("-r", "--revision", action="store_true", default=options.print_revision,
                         help="Include the document revision id (default=%(default)s)")
+    groupP.add_argument("--redirect", action="store_true", default=options.print_redirect,
+                        help="Include the document redirect (default=%(default)s)")
     groupP.add_argument("--min_text_length", type=int, default=options.min_text_length,
                         help="Minimum expanded text length required to write document (default=%(default)s)")
     groupP.add_argument("--filter_disambig_pages", action="store_true", default=options.filter_disambig_pages,
@@ -3075,6 +3104,7 @@ def main():
     options.toHTML = args.html
     options.write_json = args.json
     options.print_revision = args.revision
+    options.print_redirect = args.redirect
     options.min_text_length = args.min_text_length
     if args.html:
         options.keepLinks = True
@@ -3138,8 +3168,8 @@ def main():
 
         file = fileinput.FileInput(input_file, openhook=fileinput.hook_compressed)
         for page_data in pages_from(file):
-            id, revid, title, ns, page = page_data
-            Extractor(id, revid, title, page).extract(sys.stdout)
+            id, revid, title, ns, page, redirect = page_data
+            Extractor(id, revid, title, page, redirect).extract(sys.stdout)
         file.close()
         return
 
